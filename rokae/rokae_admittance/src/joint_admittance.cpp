@@ -157,6 +157,7 @@ private:
             }
         }
 
+        RCLCPP_INFO(get_logger(), "q_d get");
         // --- 3. 获取真实外部关节力矩（关键！使用官方API）---
         std::array<double, 7> joint_torque_measured{}, external_torque_measured{};
         std::array<double, 3> cart_torque{}, cart_force{};
@@ -179,6 +180,7 @@ private:
 
         Vector7d tau_ext = Eigen::Map<Vector7d>(external_torque_measured.data());
 
+        RCLCPP_INFO(get_logger(), "tau_ext get");
         // --- 4. 关节空间导纳控制律 ---
         Vector7d delta_q = M_.inverse() * tau_ext * 0.001;        // 惯性项
         delta_q -= D_ * q_dot_ * 0.001;                           // 阻尼项
@@ -208,20 +210,23 @@ private:
         q_ref_ = Vector7d(cur_joint_.data());
         q_dot_.setZero();
 
+        RCLCPP_INFO(get_logger(), "Starting Moving");
         // MoveJ 到当前位姿（防止跳变）
         motion_controller_->MoveJ(0.1, cur_joint_, cur_joint_);
 
+        RCLCPP_INFO(get_logger(), "Starting RT");
         motion_controller_->setControlLoop(
             std::function<rokae::JointPosition()>([this]() -> rokae::JointPosition {
                 return this->admittanceCallback();
             })
         );
 
+        RCLCPP_INFO(get_logger(), "cmd get");
         motion_controller_->startMove(RtControllerMode::jointPosition);
         
         control_thread_ = std::thread([this]() {
             try { motion_controller_->startLoop(true); }
-            catch (...) { rclcpp::shutdown(); }
+            catch (const std::exception& e) { RCLCPP_ERROR(this->get_logger(), "startLoop exception: %s", e.what()); }
         });
         control_started_ = true;
     }

@@ -35,6 +35,7 @@ class ArucoPBVSNode(Node):
                            [0.0, 0.0, 1.0]], dtype=np.float64)
 
         # ArUco 设置
+        # TODO AuUco字典需要设置
         self.aruco_dict = cv2.aruco.Dictionary_get(cv2.aruco.DICT_6X6_250)
         self.aruco_params = cv2.aruco.DetectorParameters_create()
         self.bridge = CvBridge()
@@ -56,7 +57,7 @@ class ArucoPBVSNode(Node):
         except Exception as e:
             self.get_logger().error(f"CvBridge Error: {e}")
             return
-
+        # cv_image 原始图像
         # 检测 ArUco
         corners, ids, _ = cv2.aruco.detectMarkers(cv_image, self.aruco_dict, parameters=self.aruco_params)
         
