@@ -21,6 +21,8 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(Eigen3 CONFIG REQUIRED)
+find_package(cust_msgs REQUIRED)
+find_package(sixd_interfaces REQUIRED)
 
 add_subdirectory(lib)
 
@@ -56,8 +58,30 @@ ament_target_dependencies(rokae_joint
   std_msgs
 )
 
+add_executable(rokae_node
+  src/rokae_node.cpp
+)
+
+target_link_libraries(rokae_node
+  Rokae::Rokae
+  Eigen3::Eigen
+)
+
+target_include_directories(rokae_node PRIVATE
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
+
+ament_target_dependencies(rokae_node
+  rclcpp
+  std_msgs
+  cust_msgs
+  sixd_interfaces
+)
+
 install(TARGETS
   rokae_joint
+  rokae_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
