@@ -1,0 +1,1 @@
+<img src="img/mermaid-diagram.svg" width="400" alt="Framework">

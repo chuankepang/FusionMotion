@@ -18,6 +18,13 @@ class InspireSub(Node):
             'scaled_data',
             self.inspire_callback,
             10)
+        # 控制夹爪开闭
+        self.hand_control_sub = self.create_subscription(
+            std_msgs.msg.Int32,           # 接收 0 或 1
+            'hand_control',               # 自定义 topic 名字
+            self.hand_control_callback,
+            10
+        )
         self.pub_hand_states_ = self.create_publisher(
             Stampint32array, 'hand_states', 10)
         self.port = '/dev/ttyUSB1'
@@ -49,6 +56,7 @@ class InspireSub(Node):
     def inspire_callback(self, msg):
         # self.get_logger().info(f'data_receive: {msg.data}')
 
+        # write_data为发送至灵巧手'hand_states'话题的控制指令
         write_data = self.integrate_data(msg.data)
 
         hand_states_msg = Stampint32array()
@@ -61,6 +69,19 @@ class InspireSub(Node):
             self.get_logger().info(f'force: {force}')
         if self.inspire_ready:
             self.inspire_set_angle(self.ser,1,write_data)
+
+    def hand_control_callback(self, msg):
+        cmd = msg.data
+        if cmd == 1:
+            # 闭合（抓取）
+            self.inspire_set_angle(self.ser, 1, [300, 300, 300, 300, 300, 300])
+            self.get_logger().info("Hand: CLOSE / GRIP")
+        elif cmd == 0:
+            # 张开
+            self.inspire_set_angle(self.ser, 1, [1000, 1000, 1000, 1000, 1000, 1000])
+            self.get_logger().info("Hand: OPEN")
+        else:
+            self.get_logger().warn(f"Invalid hand command: {cmd}")
 
 
     def openSerial(self,port,baudrate):
