@@ -22,6 +22,8 @@
 #include <mutex>
 #include <utility>
 
+using Vector6d = Eigen::Matrix<double, 6, 1>;
+
 namespace rokae_manipulation {
 
 class ForceBuffer : public rclcpp::Node {

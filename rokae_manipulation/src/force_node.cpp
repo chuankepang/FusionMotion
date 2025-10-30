@@ -1,6 +1,8 @@
 #include "force_buffer/force_buffer.hpp"
 #include <Eigen/Dense>
 
+using Vector6d = Eigen::Matrix<double, 6, 1>;
+
 namespace rokae_manipulation {
 
 ForceBuffer::ForceBuffer(int buffer_size)
