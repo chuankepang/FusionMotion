@@ -1,0 +1,11 @@
+[0.000000] (-) TimerEvent: {}
+[0.000509] (-) JobUnselected: {'identifier': 'cust_msgs'}
+[0.000805] (-) JobUnselected: {'identifier': 'force_srv'}
+[0.001300] (-) JobUnselected: {'identifier': 'inspire_hand'}
+[0.001593] (-) JobUnselected: {'identifier': 'pbvs'}
+[0.001856] (-) JobUnselected: {'identifier': 'rokae_node'}
+[0.001956] (-) JobUnselected: {'identifier': 'sixd_interfaces'}
+[0.002117] (rokae_admittance) JobQueued: {'identifier': 'rokae_admittance', 'dependencies': OrderedDict([('cust_msgs', '/SSD-512G/Project/FusionMotion_ws/src/install/cust_msgs'), ('sixd_interfaces', '/SSD-512G/Project/FusionMotion_ws/src/install/sixd_interfaces')])}
+[0.002228] (rokae_admittance) JobStarted: {'identifier': 'rokae_admittance'}
+[0.030458] (rokae_admittance) JobEnded: {'identifier': 'rokae_admittance', 'rc': 1}
+[0.041085] (-) EventReactorShutdown: {}
