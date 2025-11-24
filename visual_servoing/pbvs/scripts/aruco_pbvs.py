@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""
-ArUco-based Position-Based Visual Servoing (PBVS) for 6-DoF Robot
-作者：香港时间 2025-11-17 17:10 为你定制
-适用：xMate、Franka、UR、ABB 等所有 6/7 轴机械臂
-"""
+
 
 import rclpy
 from rclpy.node import Node
