@@ -55,7 +55,7 @@ sudo apt install ros-<ROS_DISTRO>-realsense2-*
 ```
 roslaunch realsense2_camera rs_camera.launch
 ```
-
+# 视力触融合对接
 一、 详细流程描述
 1. 视觉引导与粗抓取 (Vision-Guided Grasping)
 动作： 机械臂基于视觉定位移动至电连接器工头（Male）上方。
