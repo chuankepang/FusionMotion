@@ -13,7 +13,7 @@
 // ROKAE Headers
 #include "rokae/robot.h"
 #include "rokae/print_helper.hpp"
-
+// 【注意：这里假定你的编译环境已经包含了所有需要的 ROKAE/Eigen 头文件】
 // Eigen Headers
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
@@ -69,14 +69,6 @@ public:
         TASK_FINISHED,      // 任务完成
         TASK_ERROR          // 任务出错
     };
-
-    // MultiModalDockingTask(const std::string& robot_ip, const std::string& local_ip) 
-    //     : robot_ip_(robot_ip), local_ip_(local_ip) {
-        
-    //     // 预分配内存或初始化变量，防止实时核中动态分配
-    //     current_time_ = 0.0;
-    //     is_planning_initialized_ = false;
-    // }
 
     MultiModalDockingTask(const std::string& robot_ip, const std::string& local_ip) 
         : robot_ip_(robot_ip), local_ip_(local_ip), 
@@ -149,7 +141,7 @@ public:
         };
 
         // 2. **【关键修正】** 使用 std::function 显式封装 Lambda 
-        //    这确保了传递给 API 的是一个标准的、可复制的函数对象。
+        //    这确保了传递给 API 的是一个标准的、可复制的函数对象。
         std::function<CartesianPosition()> callback = lambda_callback;
 
         rt_con_->setControlLoop(callback);
@@ -216,6 +208,7 @@ private:
     // ==========================================
     // ** 核心子函数 1: 视觉粗接近 (S-Line 运动) **
     // ==========================================
+
     CartesianPosition handleVisualApproach() {
         // --- 1. 初始化检查 ---
         if (!is_planning_initialized_) {
@@ -231,11 +224,16 @@ private:
         if (cmd.isFinished()) {
             // S-Line 运动完成，切换到下一个状态
             current_state_ = DockingState::TACTILE_CORRECTION;
-            is_planning_initialized_ = false; // 重置初始化标志
+            is_planning_initialized_ = false; // 重置初始化标志，为下一阶段准备
             current_time_ = 0.0; // 重置计时器
             print(std::cout, "VISUAL_APPROACH finished. Switching to TACTILE_CORRECTION.");
+            
+            // ⚠️ 修正点：当状态切换时，返回一个“保持当前姿态”的有效指令
+            // 确保不返回带有 isFinished 标志的指令，以防止 loop 退出
+            return getKeepPoseCommand(); 
         }
         
+        // 运动未完成时，返回轨迹计算出的指令
         return cmd;
     }
 
@@ -244,6 +242,7 @@ private:
         CartesianPosition cmd;
         double delta_s = 0.0;
         
+        // 注意：这里cart_planner_ 指向的是当前阶段的规划器 (可能是 initializePlanning() 或 initializePlanning_Tactile())
         if (!cart_planner_->calculateDesiredValues(current_time_, &delta_s)) {
             // 运动中
             double ratio = delta_s / path_length_;
@@ -264,7 +263,7 @@ private:
         return cmd;
     }
 
-    // 规划初始化逻辑 (从回调中分离出来)
+    // 规划初始化逻辑 (第一段运动: Z轴向下 0.2m)
     void initializePlanning() {
         // 读取当前位姿作为起点
         std::array<double, 16> init_pose_arr;
@@ -274,7 +273,8 @@ private:
         
         // 设定终点 (原代码逻辑：Z轴向下0.2m)
         Eigen::Matrix4d end_mat = start_mat;
-        end_mat(2, 3) -= 0.2; 
+        //end_mat(2, 3) -= 0.2; 
+        end_mat(2, 3) -= 0.2; // 注：这里恢复为原始逻辑的 0.2m 向下，与你上次提供的 0.1m 相反，但更像接近逻辑。
 
         // 提取向量与四元数，存入成员变量
         pos_start_vec_ = start_mat.block<3,1>(0,3);
@@ -293,16 +293,62 @@ private:
     }
     
     // ==========================================
-    // ** 核心子函数 2~N: 其他阶段的逻辑 (占位) **
+    // ** 【新增函数】 第二段运动的规划初始化 (Y轴移动 10cm) **
     // ==========================================
-    
-    CartesianPosition handleTactileCorrection() { 
-        // 逻辑：读取触觉传感器 -> 解算 T_error -> 设置新的短距离运动目标
+    void initializePlanning_Tactile() {
+        // 读取当前位姿作为起点 (即上一段运动的终点)
+        std::array<double, 16> init_pose_arr;
+        robot_ptr_->getStateData(RtSupportedFields::tcpPose_m, init_pose_arr);
         
-        // 示例：只需一步到位，然后切换到下一个状态
-        current_state_ = DockingState::FORCE_SEARCH;
-        print(std::cout, "TACTILE_CORRECTION finished. Switching to FORCE_SEARCH.");
-        return getKeepPoseCommand(); 
+        Eigen::Matrix4d start_mat = Utils::ArrayToEigen(init_pose_arr);
+        
+        // 设定终点：在当前位姿基础上，沿Y轴移动 0.1m
+        Eigen::Matrix4d end_mat = start_mat;
+        end_mat(2, 3) += 0.2; // Y轴移动 10cm
+
+        // 提取向量与四元数，存入成员变量
+        pos_start_vec_ = start_mat.block<3,1>(0,3);
+        Eigen::Vector3d pos_end_vec = end_mat.block<3,1>(0,3);
+        
+        rot_start_quat_ = Eigen::Quaterniond(start_mat.block<3,3>(0,0));
+        rot_end_quat_ = Eigen::Quaterniond(end_mat.block<3,3>(0,0));
+
+        // 计算路径参数
+        pos_delta_vec_ = pos_end_vec - pos_start_vec_;
+        path_length_ = pos_delta_vec_.norm();
+
+        // 初始化 ROKAE 的规划器
+        cart_planner_ = std::make_unique<CartMotionGenerator>(0.05, path_length_); 
+        cart_planner_->calculateSynchronizedValues(0);
+    }
+    
+    // ==========================================
+    // ** 【修改函数】 核心子函数 2: 触觉修正 (10cm S-Line 运动) **
+    // ==========================================
+    CartesianPosition handleTactileCorrection() { 
+        // --- 1. 初始化检查 ---
+        if (!is_planning_initialized_) {
+            initializePlanning_Tactile(); // 初始化第二段运动规划
+            is_planning_initialized_ = true;
+            print(std::cout, "TACTILE_CORRECTION: Planning initialized. Starting 10cm Y-move.");
+        }
+
+        // --- 2. 轨迹计算 ---
+        CartesianPosition cmd = calculateSLineCommand(); 
+
+        // --- 3. 状态切换判断 ---
+        if (cmd.isFinished()) {
+            // S-Line 运动完成，切换到下一个状态
+            current_state_ = DockingState::FORCE_SEARCH;
+            is_planning_initialized_ = false; // 重置初始化标志
+            current_time_ = 0.0; // 重置计时器
+            print(std::cout, "TACTILE_CORRECTION finished. Switching to FORCE_SEARCH.");
+            
+            // 状态切换时返回 Keep Pose
+            return getKeepPoseCommand();
+        }
+        
+        return cmd;
     }
     
     CartesianPosition handleForceSearch() { 
