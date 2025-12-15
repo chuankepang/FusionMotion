@@ -171,11 +171,6 @@ private:
     Eigen::Quaterniond rot_end_quat_;
     std::unique_ptr<CartMotionGenerator> cart_planner_;
 
-    std::array<double, 16> last_sent_pose_{};  // 新增：记住上一帧发出的指令
-    bool has_last_pose_ = false;
-
-    std::array<double, 16> last_planning_end_pose_{}; // 存储上一次规划的理论终点
-
 // ==========================================
     // 实时控制核心回调函数 (状态机主循环)
     // ==========================================
@@ -227,22 +222,10 @@ private:
 
         // --- 3. 状态切换判断 ---
         if (cmd.isFinished()) {
-
-            // 关键：在 Planning 结束后，将最后发送的指令更新为理论终点
-            // (在运动结束时，last_sent_pose_ 应该已经收敛到理论终点附近)
-            // 这一步确保在进入 Keep Pose 阶段，指令是理论终点
-            last_sent_pose_ = last_planning_end_pose_;
-
             // S-Line 运动完成，切换到下一个状态
             current_state_ = DockingState::TACTILE_CORRECTION;
             is_planning_initialized_ = false; // 重置初始化标志，为下一阶段准备
             current_time_ = 0.0; // 重置计时器
-
-            // // 新增：过渡期（让控制器“喘口气”）
-            // for (int i = 0; i < 500; ++i) {  // 0.5 秒
-            //     return getKeepPoseCommand();
-            // }
-
             print(std::cout, "VISUAL_APPROACH finished. Switching to TACTILE_CORRECTION.");
             
             // ⚠️ 修正点：当状态切换时，返回一个“保持当前姿态”的有效指令
@@ -273,9 +256,6 @@ private:
             trans_cur.block<3,1>(0,3) = pos_cur;
 
             cmd.pos = Utils::EigenToArray(trans_cur);
-
-            last_sent_pose_ = cmd.pos;   // 新增：记住这一帧
-            has_last_pose_ = true;
         } else {
             // 规划结束
             cmd.setFinished();
@@ -295,9 +275,6 @@ private:
         Eigen::Matrix4d end_mat = start_mat;
         //end_mat(2, 3) -= 0.2; 
         end_mat(2, 3) -= 0.2; // 注：这里恢复为原始逻辑的 0.2m 向下，与你上次提供的 0.1m 相反，但更像接近逻辑。
-
-        // 【新增】存储理论终点，用于下一段运动的规划起点
-        last_planning_end_pose_ = Utils::EigenToArray(end_mat);
 
         // 提取向量与四元数，存入成员变量
         pos_start_vec_ = start_mat.block<3,1>(0,3);
@@ -322,16 +299,12 @@ private:
         // 读取当前位姿作为起点 (即上一段运动的终点)
         std::array<double, 16> init_pose_arr;
         robot_ptr_->getStateData(RtSupportedFields::tcpPose_m, init_pose_arr);
-
         
         Eigen::Matrix4d start_mat = Utils::ArrayToEigen(init_pose_arr);
         
         // 设定终点：在当前位姿基础上，沿Y轴移动 0.1m
         Eigen::Matrix4d end_mat = start_mat;
-        end_mat(2, 3) += 0.1; // Y轴移动 10cm
-
-        // 【新增】存储本段的理论终点
-        last_planning_end_pose_ = Utils::EigenToArray(end_mat);
+        end_mat(2, 3) += 0.2; // Y轴移动 10cm
 
         // 提取向量与四元数，存入成员变量
         pos_start_vec_ = start_mat.block<3,1>(0,3);
@@ -369,12 +342,6 @@ private:
             current_state_ = DockingState::FORCE_SEARCH;
             is_planning_initialized_ = false; // 重置初始化标志
             current_time_ = 0.0; // 重置计时器
-
-            // // 新增：过渡期（让控制器“喘口气”）
-            // for (int i = 0; i < 500; ++i) {  // 0.5 秒
-            //     return getKeepPoseCommand();
-            // }
-
             print(std::cout, "TACTILE_CORRECTION finished. Switching to FORCE_SEARCH.");
             
             // 状态切换时返回 Keep Pose
@@ -417,22 +384,18 @@ private:
 
     // 辅助函数：返回当前位姿指令，使机器人静止
     CartesianPosition getKeepPoseCommand() {
-        CartesianPosition cmd;
-
-        if (has_last_pose_) {
-            // 关键：返回上一帧发出的指令（保证连续性！）
-            cmd.pos = last_sent_pose_;
+        std::array<double, 16> current_pose_arr;
+        // 尝试读取当前位姿，如果读取失败，返回一个空命令
+        if (robot_ptr_->getStateData(RtSupportedFields::tcpPose_m, current_pose_arr)) {
+            CartesianPosition cmd;
+            cmd.pos = current_pose_arr;
+            return cmd;
         } else {
-            // 第一帧或异常时，读取当前位姿
-            std::array<double, 16> current{};
-            if (robot_ptr_->getStateData(RtSupportedFields::tcpPose_m, current)) {
-                cmd.pos = current;
-                last_sent_pose_ = current;
-                has_last_pose_ = true;
-            }
+            // 如果无法获取状态数据，返回一个完成标志，或者更安全的处理
+            CartesianPosition cmd;
+            // ⚠️ 实际项目中，在这里应触发 ERROR 状态
+            return cmd; 
         }
-
-        return cmd;
     }
 };
 
