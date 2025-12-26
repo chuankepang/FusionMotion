@@ -82,7 +82,30 @@ ament_target_dependencies(joint_admittance
   sixd_interfaces
 )
 
+add_executable(rokae_rt
+    src/rokae_rt.cpp
+)
+
+target_link_libraries(rokae_rt
+  Rokae::Rokae
+  Eigen3::Eigen
+)
+
+target_include_directories(rokae_rt PRIVATE
+    ${EIGEN3_INCLUDE_DIR}
+    include
+)
+
+ament_target_dependencies(rokae_rt
+  rclcpp
+  std_msgs
+  cust_msgs
+  Eigen3
+  sixd_interfaces
+)
+
 install(TARGETS
+  rokae_rt 
   cartesian_admittance
   joint_admittance
   DESTINATION lib/${PROJECT_NAME}
