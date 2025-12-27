@@ -1,464 +1,222 @@
 /**
- * @file modular_framework.cpp
- * @brief 视力触项目基础框架 - 模块化重构版
- * @note 基于 ROKAE C++ API，仅改变代码结构，保留原有S型规划直线运动功能
+ * @file complex_task_manager.cpp
+ * @brief 实时模式 - 多阶段任务管理架构（S规划 + 任务状态机）
  */
 
 #include <iostream>
 #include <cmath>
 #include <thread>
-#include <atomic>
-#include <mutex>
-
-// ROKAE Headers
+#include <vector>
+#include <memory>
+#include <Eigen/Dense>
 #include "rokae/robot.h"
 #include "rokae/print_helper.hpp"
-// 【注意：这里假定你的编译环境已经包含了所有需要的 ROKAE/Eigen 头文件】
-// Eigen Headers
-#include <Eigen/Dense>
-#include <Eigen/Geometry>
 
 using namespace rokae;
-using namespace std;
 
-// ==========================================
-// 1. 定义辅助工具 (将来可以移到 utils.hpp)
-// ==========================================
-namespace Utils {
-    // 将 std::array<double, 16> 转换为 Eigen::Matrix4d
-    Eigen::Matrix4d ArrayToEigen(const std::array<double, 16>& pose) {
-        Eigen::Matrix4d mat;
-        // 注意：这里默认ROKAE输出是列主序(Column-Major)还是行主序(Row-Major)
-        // 假设是行主序，逐行填充。如果实际运行不对，需调整。
-        mat << pose[0], pose[1], pose[2], pose[3],
-               pose[4], pose[5], pose[6], pose[7],
-               pose[8], pose[9], pose[10], pose[11],
-               pose[12], pose[13], pose[14], pose[15];
-        return mat;
-    }
-
-    // 将 Eigen::Matrix4d 转换为 std::array<double, 16>
-    std::array<double, 16> EigenToArray(const Eigen::Matrix4d& mat) {
-        std::array<double, 16> pose;
-        // 展平为一维数组
-        int idx = 0;
-        for(int i=0; i<4; ++i) {
-            for(int j=0; j<4; ++j) {
-                pose[idx++] = mat(i, j);
-            }
-        }
-        return pose;
-    }
-}
-
-// ==========================================
-// 2. 核心任务类 (将来扩展视触融合逻辑的主要地方)
-// ==========================================
-class MultiModalDockingTask {
+// =============================================================================
+// 1. 实时任务抽象基类
+// =============================================================================
+class RTTask {
 public:
-
-    // 状态管理枚举放在 public 区域，供类内部使用，也供外部读取当前状态
-    enum class DockingState {
-        IDLE,               // 初始空闲/待机
-        VISUAL_APPROACH,    // 阶段1: 视觉伺服/粗接近
-        TACTILE_CORRECTION, // 阶段2: 触觉修正/微调
-        FORCE_SEARCH,       // 阶段3: 寻孔 (力控/位置混合)
-        ADMITTANCE_INSERT,  // 阶段4: 柔顺插入
-        EXTRACTION_PREP,    // 阶段5: 拔出准备 (插入后的新阶段)
-        EXTRACTION_PULL,    // 阶段6: 柔顺拔出
-        TASK_FINISHED,      // 任务完成
-        TASK_ERROR          // 任务出错
-    };
-
-    MultiModalDockingTask(const std::string& robot_ip, const std::string& local_ip) 
-        : robot_ip_(robot_ip), local_ip_(local_ip), 
-        current_time_(0.0), is_planning_initialized_(false),
-        current_state_(DockingState::IDLE) { // 默认初始状态设为 IDLE
-        //... 构造函数体
-        }
-
-    ~MultiModalDockingTask() = default;
-
-    // 初始化机器人连接与配置
-    bool initRobot() {
-        try {
-            std::error_code ec;
-            robot_ptr_ = std::make_unique<rokae::xMateErProRobot>(robot_ip_, local_ip_);
-            
-            robot_ptr_->setOperateMode(rokae::OperateMode::automatic, ec);
-            robot_ptr_->setMotionControlMode(MotionControlMode::RtCommand, ec);
-            robot_ptr_->setPowerState(true, ec);
-            
-            // 获取控制器指针s
-            rt_con_ = robot_ptr_->getRtMotionController().lock();
-            if (!rt_con_) return false;
-
-            // 启动状态接收 (重要: 1ms周期)
-            robot_ptr_->startReceiveRobotState(std::chrono::milliseconds(1), 
-                {RtSupportedFields::jointPos_m, RtSupportedFields::tcpPose_m});
-            
-            print(std::cout, "Robot Initialized Successfully.");
-            return true;
-
-        } catch (const std::exception& e) {
-            print(std::cerr, e.what());
-            return false;
-        }
-    }
-
-    // 执行回零或预备姿态 (非实时阻塞运动)
-    void moveToStartPose() {
-        std::error_code ec;
-        robot_ptr_->updateRobotState(std::chrono::milliseconds(1));
-        
-        std::array<double, 7> current_jnt;
-        robot_ptr_->getStateData(RtSupportedFields::jointPos_m, current_jnt);
-
-        // 目标拖拽位姿 (原代码中的硬编码)
-        std::array<double, 7> q_drag = {0, M_PI/6, 0, M_PI/3, 0, M_PI/2, 0};
-        //std::array<double, 7> q_drag = {0, 0, 0, 0, 0, 0, 0};
-        
-        print(std::cout, "Moving to Start Position...");
-        rt_con_->MoveJ(0.5, current_jnt, q_drag);
-        
-        // 切换到笛卡尔位置控制模式，准备实时控制
-        rt_con_->startMove(RtControllerMode::cartesianPosition);
-    }
-
-    // 启动实时控制循环
-    void startRealTimeLoop() {
-
-        // 关键：在启动实时循环前，将状态从 IDLE 切换到第一个运行阶段
-        if (current_state_ == DockingState::IDLE) {
-            current_state_ = DockingState::VISUAL_APPROACH;
-            print(std::cout, "Task started. State: VISUAL_APPROACH");
-        }
-
-        print(std::cout, "Starting Real-Time Control Loop...");
-
-        // 1. 将成员函数绑定为 Lambda
-        auto lambda_callback = [this]() -> CartesianPosition {
-            return this->controlCallback();
-        };
-
-        // 2. **【关键修正】** 使用 std::function 显式封装 Lambda 
-        //    这确保了传递给 API 的是一个标准的、可复制的函数对象。
-        std::function<CartesianPosition()> callback = lambda_callback;
-
-        rt_con_->setControlLoop(callback);
-        rt_con_->startLoop(true); // true 表示阻塞主线程直到停止
-        print(std::cout, "Control Loop Finished.");
-    }
-
-private:
-
-// 机器人对象
-    std::string robot_ip_;
-    std::string local_ip_;
-
-    std::unique_ptr<rokae::xMateErProRobot> robot_ptr_;
-    
-    // **最终修正类型：使用 API 明确指出的模板类型**
-    std::shared_ptr<rokae::RtMotionControlCobot<7>> rt_con_;
-    
-    double current_time_;
-    bool is_planning_initialized_;
-    DockingState current_state_;  // 当前任务状态
-    
-    double path_length_;
-    Eigen::Vector3d pos_start_vec_;
-    Eigen::Vector3d pos_delta_vec_;
-    Eigen::Quaterniond rot_start_quat_;
-    Eigen::Quaterniond rot_end_quat_;
-    std::unique_ptr<CartMotionGenerator> cart_planner_;
-
-    std::array<double, 16> last_sent_pose_{};  // 新增：记住上一帧发出的指令
-    bool has_last_pose_ = false;
-
-    std::array<double, 16> last_planning_end_pose_{}; // 存储上一次规划的理论终点
-
-// ==========================================
-    // 实时控制核心回调函数 (状态机主循环)
-    // ==========================================
-    CartesianPosition controlCallback() {
-        current_time_ += 0.001; 
-
-        switch (current_state_) {
-            case DockingState::VISUAL_APPROACH:
-                return handleVisualApproach(); 
-            
-            case DockingState::TACTILE_CORRECTION:
-                return handleTactileCorrection(); 
-            
-            case DockingState::FORCE_SEARCH:
-                return handleForceSearch(); 
-            
-            case DockingState::ADMITTANCE_INSERT:
-                return handleAdmittanceInsert(); 
-            
-            case DockingState::EXTRACTION_PREP:
-                return handleExtractionPrep(); 
-                
-            case DockingState::EXTRACTION_PULL:
-                return handleExtractionPull();
-            
-            case DockingState::IDLE:
-            case DockingState::TASK_ERROR:
-            case DockingState::TASK_FINISHED:
-            default:
-                // 停止运动或保持静止
-                return getKeepPoseCommand(); 
-        }
-    }
-    
-    // ==========================================
-    // ** 核心子函数 1: 视觉粗接近 (S-Line 运动) **
-    // ==========================================
-
-    CartesianPosition handleVisualApproach() {
-        // --- 1. 初始化检查 ---
-        if (!is_planning_initialized_) {
-            initializePlanning(); // 初始化规划参数
-            is_planning_initialized_ = true;
-            print(std::cout, "VISUAL_APPROACH: Planning initialized. Starting move.");
-        }
-
-        // --- 2. 轨迹计算 ---
-        CartesianPosition cmd = calculateSLineCommand(); 
-
-        // --- 3. 状态切换判断 ---
-        if (cmd.isFinished()) {
-
-            // 关键：在 Planning 结束后，将最后发送的指令更新为理论终点
-            // (在运动结束时，last_sent_pose_ 应该已经收敛到理论终点附近)
-            // 这一步确保在进入 Keep Pose 阶段，指令是理论终点
-            last_sent_pose_ = last_planning_end_pose_;
-
-            // S-Line 运动完成，切换到下一个状态
-            current_state_ = DockingState::TACTILE_CORRECTION;
-            is_planning_initialized_ = false; // 重置初始化标志，为下一阶段准备
-            current_time_ = 0.0; // 重置计时器
-
-            // // 新增：过渡期（让控制器“喘口气”）
-            // for (int i = 0; i < 500; ++i) {  // 0.5 秒
-            //     return getKeepPoseCommand();
-            // }
-
-            print(std::cout, "VISUAL_APPROACH finished. Switching to TACTILE_CORRECTION.");
-            
-            // ⚠️ 修正点：当状态切换时，返回一个“保持当前姿态”的有效指令
-            // 确保不返回带有 isFinished 标志的指令，以防止 loop 退出
-            return getKeepPoseCommand(); 
-        }
-        
-        // 运动未完成时，返回轨迹计算出的指令
-        return cmd;
-    }
-
-    // 提取 S-Line 轨迹计算逻辑
-    CartesianPosition calculateSLineCommand() {
-        CartesianPosition cmd;
-        double delta_s = 0.0;
-        
-        // 注意：这里cart_planner_ 指向的是当前阶段的规划器 (可能是 initializePlanning() 或 initializePlanning_Tactile())
-        if (!cart_planner_->calculateDesiredValues(current_time_, &delta_s)) {
-            // 运动中
-            double ratio = delta_s / path_length_;
-            Eigen::Vector3d pos_cur = pos_start_vec_ + pos_delta_vec_ * ratio;
-            
-            Eigen::Quaterniond rot_cur = rot_start_quat_.slerp(ratio, rot_end_quat_);
-            Eigen::Matrix3d mat_cur = rot_cur.normalized().toRotationMatrix();
-
-            Eigen::Matrix4d trans_cur = Eigen::Matrix4d::Identity();
-            trans_cur.block<3,3>(0,0) = mat_cur;
-            trans_cur.block<3,1>(0,3) = pos_cur;
-
-            cmd.pos = Utils::EigenToArray(trans_cur);
-
-            last_sent_pose_ = cmd.pos;   // 新增：记住这一帧
-            has_last_pose_ = true;
-        } else {
-            // 规划结束
-            cmd.setFinished();
-        }
-        return cmd;
-    }
-
-    // 规划初始化逻辑 (第一段运动: Z轴向下 0.2m)
-    void initializePlanning() {
-        // 读取当前位姿作为起点
-        std::array<double, 16> init_pose_arr;
-        std::error_code ec;
-        //robot_ptr_->getStateData(RtSupportedFields::tcpPose_m, init_pose_arr);
-        init_pose_arr = robot_ptr_->cartPosture(CoordinateType::endInRef, ec);
-        
-        Eigen::Matrix4d start_mat = Utils::ArrayToEigen(init_pose_arr);
-        
-        // 设定终点 (原代码逻辑：Z轴向下0.2m)
-        Eigen::Matrix4d end_mat = start_mat;
-        //end_mat(2, 3) -= 0.2; 
-        end_mat(2, 3) -= 0.2; // 注：这里恢复为原始逻辑的 0.2m 向下，与你上次提供的 0.1m 相反，但更像接近逻辑。
-
-        // 【新增】存储理论终点，用于下一段运动的规划起点
-        last_planning_end_pose_ = Utils::EigenToArray(end_mat);
-
-        // 提取向量与四元数，存入成员变量
-        pos_start_vec_ = start_mat.block<3,1>(0,3);
-        Eigen::Vector3d pos_end_vec = end_mat.block<3,1>(0,3);
-        
-        rot_start_quat_ = Eigen::Quaterniond(start_mat.block<3,3>(0,0));
-        rot_end_quat_ = Eigen::Quaterniond(end_mat.block<3,3>(0,0));
-
-        // 计算路径参数
-        pos_delta_vec_ = pos_end_vec - pos_start_vec_;
-        path_length_ = pos_delta_vec_.norm();
-
-        // 初始化 ROKAE 的规划器
-        cart_planner_ = std::make_unique<CartMotionGenerator>(0.05, path_length_); 
-        cart_planner_->calculateSynchronizedValues(0);
-    }
-    
-    // ==========================================
-    // ** 【新增函数】 第二段运动的规划初始化 (Y轴移动 10cm) **
-    // ==========================================
-    void initializePlanning_Tactile() {
-        // 读取当前位姿作为起点 (即上一段运动的终点)
-        std::array<double, 16> init_pose_arr;
-        std::error_code ec;
-        //robot_ptr_->getStateData(RtSupportedFields::tcpPose_m, init_pose_arr);
-        init_pose_arr = robot_ptr_->cartPosture(CoordinateType::flangeInBase, ec);
-
-        
-        Eigen::Matrix4d start_mat = Utils::ArrayToEigen(init_pose_arr);
-        
-        // 设定终点：在当前位姿基础上，沿Y轴移动 0.1m
-        Eigen::Matrix4d end_mat = start_mat;
-        end_mat(2, 3) += 0.1; // Y轴移动 10cm
-
-        // 【新增】存储本段的理论终点
-        last_planning_end_pose_ = Utils::EigenToArray(end_mat);
-
-        // 提取向量与四元数，存入成员变量
-        pos_start_vec_ = start_mat.block<3,1>(0,3);
-        Eigen::Vector3d pos_end_vec = end_mat.block<3,1>(0,3);
-        
-        rot_start_quat_ = Eigen::Quaterniond(start_mat.block<3,3>(0,0));
-        rot_end_quat_ = Eigen::Quaterniond(end_mat.block<3,3>(0,0));
-
-        // 计算路径参数
-        pos_delta_vec_ = pos_end_vec - pos_start_vec_;
-        path_length_ = pos_delta_vec_.norm();
-
-        // 初始化 ROKAE 的规划器
-        cart_planner_ = std::make_unique<CartMotionGenerator>(0.05, path_length_); 
-        cart_planner_->calculateSynchronizedValues(0);
-    }
-    
-    // ==========================================
-    // ** 【修改函数】 核心子函数 2: 触觉修正 (10cm S-Line 运动) **
-    // ==========================================
-    CartesianPosition handleTactileCorrection() { 
-        // --- 1. 初始化检查 ---
-        if (!is_planning_initialized_) {
-            initializePlanning_Tactile(); // 初始化第二段运动规划
-            is_planning_initialized_ = true;
-            print(std::cout, "TACTILE_CORRECTION: Planning initialized. Starting 10cm Y-move.");
-        }
-
-        // --- 2. 轨迹计算 ---
-        CartesianPosition cmd = calculateSLineCommand(); 
-
-        // --- 3. 状态切换判断 ---
-        if (cmd.isFinished()) {
-            // S-Line 运动完成，切换到下一个状态
-            current_state_ = DockingState::FORCE_SEARCH;
-            is_planning_initialized_ = false; // 重置初始化标志
-            current_time_ = 0.0; // 重置计时器
-
-            // // 新增：过渡期（让控制器“喘口气”）
-            // for (int i = 0; i < 500; ++i) {  // 0.5 秒
-            //     return getKeepPoseCommand();
-            // }
-
-            print(std::cout, "TACTILE_CORRECTION finished. Switching to FORCE_SEARCH.");
-            
-            // 状态切换时返回 Keep Pose
-            return getKeepPoseCommand();
-        }
-        
-        return cmd;
-    }
-    
-    CartesianPosition handleForceSearch() { 
-        // 逻辑：切换到力控模式 (RtControllerMode::cartesianImpedance)
-        // -> 执行螺旋搜索算法
-        // -> 检测到入孔力/位移突变
-        
-        current_state_ = DockingState::ADMITTANCE_INSERT;
-        print(std::cout, "FORCE_SEARCH finished. Switching to ADMITTANCE_INSERT.");
-        return getKeepPoseCommand();
-    }
-    
-    CartesianPosition handleAdmittanceInsert() { 
-        // 逻辑：执行分阶段变参数导纳控制
-        // -> 检测到插到底部
-        
-        current_state_ = DockingState::TASK_FINISHED;
-        print(std::cout, "ADMITTANCE_INSERT finished. Switching to TASK_FINISHED.");
-        return getKeepPoseCommand();
-    }
-    
-    CartesianPosition handleExtractionPrep() {
-        // 逻辑：可能需要做短距离抬升或角度调整，以便分离
-        current_state_ = DockingState::EXTRACTION_PULL;
-        return getKeepPoseCommand();
-    }
-
-    CartesianPosition handleExtractionPull() {
-        // 逻辑：柔顺拔出，Z轴施加负向推力或恒定位移
-        current_state_ = DockingState::TASK_FINISHED;
-        return getKeepPoseCommand();
-    }
-
-    // 辅助函数：返回当前位姿指令，使机器人静止
-    CartesianPosition getKeepPoseCommand() {
-        CartesianPosition cmd;
-
-        if (has_last_pose_) {
-            // 关键：返回上一帧发出的指令（保证连续性！）
-            cmd.pos = last_sent_pose_;
-        } else {
-            // 第一帧或异常时，读取当前位姿
-            std::array<double, 16> current{};
-            if (robot_ptr_->getStateData(RtSupportedFields::tcpPose_m, current)) {
-                cmd.pos = current;
-                last_sent_pose_ = current;
-                has_last_pose_ = true;
-            }
-        }
-
-        return cmd;
-    }
+    virtual ~RTTask() = default;
+    // 任务启动时的初始化逻辑
+    virtual void onStart(const std::array<double, 16>& currentPose) = 0;
+    // 每 1ms 执行一次的计算逻辑，返回当前周期的指令位姿
+    virtual CartesianPosition update(double dt) = 0;
+    // 任务是否结束的判断条件
+    virtual bool isFinished() const = 0;
+    // 任务名称（调试用）
+    virtual std::string name() const = 0;
 };
 
-// ==========================================
-// 3. 主函数 (Main)
-// ==========================================
-int main() {
-    // 实例化任务对象
-    MultiModalDockingTask task("192.168.0.160", "192.168.0.100");
+// =============================================================================
+// 2. 笛卡尔空间 S 曲线直线运动任务 (API 封装)
+// =============================================================================
+class SLineTask : public RTTask {
+public:
+    SLineTask(const std::array<double, 16>& target, double v_max = 0.1, std::string taskName = "SLineMove")
+        : target_pose_(target), v_limit_(v_max), task_name_(taskName), finished_(false), time_(0) {}
 
-    // 1. 连接机器人
-    if (!task.initRobot()) {
-        return -1;
+    std::string name() const override { return task_name_; }
+
+    void onStart(const std::array<double, 16>& currentPose) override {
+        start_pose_ = currentPose;
+        time_ = 0;
+        finished_ = false;
+
+        // 计算距离
+        Eigen::Vector3d p1(start_pose_[3], start_pose_[7], start_pose_[11]);
+        Eigen::Vector3d p2(target_pose_[3], target_pose_[7], target_pose_[11]);
+        double dist = (p2 - p1).norm();
+
+        // 初始化 S 曲线生成器
+        generator_ = std::make_unique<CartMotionGenerator>(v_limit_, (dist < 0.0001 ? 0.0001 : dist));
+        generator_->calculateSynchronizedValues(0);
+        
+        std::cout << "[" << task_name_ << "] 启动: 目标距离 " << dist << "m" << std::endl;
     }
 
-    // 2. 运动到初始位置
-    task.moveToStartPose();
+    CartesianPosition update(double dt) override {
+        time_ += dt;
+        double delta_s = 0;
+        // 计算当前时刻应达到的路径进度 delta_s
+        finished_ = generator_->calculateDesiredValues(time_, &delta_s);
 
-    // 3. 执行实时任务
-    // 这里未来可以改为 switch-case 状态机来调度不同的任务阶段 (视觉/触觉/插入)
-    task.startRealTimeLoop();
+        Eigen::Vector3d p1(start_pose_[3], start_pose_[7], start_pose_[11]);
+        Eigen::Vector3d p2(target_pose_[3], target_pose_[7], target_pose_[11]);
+        double total_dist = (p2 - p1).norm();
+        if (total_dist < 0.0001) total_dist = 0.0001;
+
+        // 1. 位置线性插值
+        Eigen::Vector3d p_cur = p1 + (p2 - p1) * (delta_s / total_dist);
+
+        // 2. 姿态 SLERP 插值
+        Eigen::Matrix3d m1, m2;
+        m1 << start_pose_[0], start_pose_[1], start_pose_[2], start_pose_[4], start_pose_[5], start_pose_[6], start_pose_[8], start_pose_[9], start_pose_[10];
+        m2 << target_pose_[0], target_pose_[1], target_pose_[2], target_pose_[4], target_pose_[5], target_pose_[6], target_pose_[8], target_pose_[9], target_pose_[10];
+        Eigen::Quaterniond q1(m1), q2(m2);
+        Eigen::Quaterniond q_cur = q1.slerp(delta_s / total_dist, q2);
+        Eigen::Matrix3d mat = q_cur.toRotationMatrix();
+
+        // 3. 封装输出指令
+        CartesianPosition cmd;
+        cmd.pos = { mat(0,0), mat(0,1), mat(0,2), p_cur(0),
+                    mat(1,0), mat(1,1), mat(1,2), p_cur(1),
+                    mat(2,0), mat(2,1), mat(2,2), p_cur(2),
+                    0, 0, 0, 1 };
+        
+        if (finished_) cmd.setFinished(); 
+        return cmd;
+    }
+
+    bool isFinished() const override { return finished_; }
+
+private:
+    std::array<double, 16> start_pose_, target_pose_;
+    std::unique_ptr<CartMotionGenerator> generator_;
+    double v_limit_, time_;
+    bool finished_;
+    std::string task_name_;
+};
+
+// =============================================================================
+// 3. 复杂任务占位符 (例如：视觉伺服或搜索)
+// =============================================================================
+class ComplexPhasePlaceholder : public RTTask {
+public:
+    std::string name() const override { return "ComplexPhase_Search"; }
+    void onStart(const std::array<double, 16>& currentPose) override {
+        std::cout << "[SearchPhase] 启动：开始执行复杂搜索算法..." << std::endl;
+        time_ = 0;
+        start_pose_ = currentPose;
+    }
+    CartesianPosition update(double dt) override {
+        time_ += dt;
+        CartesianPosition cmd;
+        cmd.pos = start_pose_;
+        // 模拟：在当前位置进行 2cm 的简谐搜索运动
+        cmd.pos[3] += 0.02 * std::sin(2 * M_PI * time_); 
+        if (time_ > 5.0) is_done_ = true; // 5秒后模拟完成
+        return cmd;
+    }
+    bool isFinished() const override { return is_done_; }
+private:
+    bool is_done_ = false;
+    double time_ = 0;
+    std::array<double, 16> start_pose_;
+};
+
+// =============================================================================
+// 4. 主程序
+// =============================================================================
+int main() {
+    using namespace std;
+    rokae::xMateErProRobot robot;
+
+    try {
+        robot.connectToRobot("192.168.0.160", "192.168.0.100");
+    } catch(const rokae::Exception &e) {
+        cerr << "连接失败: " << e.what() << endl;
+        return 0;
+    }
+
+    std::error_code ec;
+    robot.setOperateMode(rokae::OperateMode::automatic, ec);
+    robot.setMotionControlMode(MotionControlMode::RtCommand, ec);
+    robot.setPowerState(true, ec);
+
+    try {
+        auto rtCon = robot.getRtMotionController().lock();
+        robot.startReceiveRobotState(std::chrono::milliseconds(1), {RtSupportedFields::tcpPose_m});
+        
+        // --- 任务编排 ---
+        vector<shared_ptr<RTTask>> taskQueue;
+        
+        // 1. 获取当前初始位姿
+        robot.updateRobotState(std::chrono::milliseconds(1));
+        std::array<double, 16> init_pose;
+        robot.getStateData(RtSupportedFields::tcpPose_m, init_pose);
+
+        // 2. 添加阶段1: 向下运动到预定视觉观测点
+        auto posA = init_pose; posA[11] -= 0.15; 
+        taskQueue.push_back(make_shared<SLineTask>(posA, 0.1, "Phase1_MoveToView"));
+
+        // 3. 添加阶段2: 执行搜索/伺服 (模拟)
+        taskQueue.push_back(make_shared<ComplexPhasePlaceholder>());
+
+        // 4. 添加阶段3: 水平回退
+        auto posB = posA; posB[3] += 0.1;
+        taskQueue.push_back(make_shared<SLineTask>(posB, 0.05, "Phase3_Retract"));
+
+        // --- 实时管理器状态 ---
+        size_t currentTaskIdx = 0;
+        bool taskInitialized = false;
+
+        // =====================================================================
+        // 核心实时回调逻辑
+        // =====================================================================
+        std::function<CartesianPosition()> masterCallback = [&]() {
+            if (currentTaskIdx >= taskQueue.size()) {
+                CartesianPosition endCmd;
+                endCmd.setFinished();
+                return endCmd;
+            }
+
+            auto& currentTask = taskQueue[currentTaskIdx];
+
+            // A. 自动初始化每个新阶段
+            if (!taskInitialized) {
+                std::array<double, 16> current_actual;
+                robot.getStateData(RtSupportedFields::tcpPose_m, current_actual);
+                currentTask->onStart(current_actual);
+                taskInitialized = true;
+            }
+
+            // B. 调用当前任务组件的计算逻辑 (1ms 周期)
+            CartesianPosition cmd = currentTask->update(0.001);
+
+            // C. 检查当前阶段是否完成并自动跳转
+            if (currentTask->isFinished()) {
+                currentTaskIdx++;
+                taskInitialized = false; // 触发下一个任务的 onStart
+                cout << ">>> 任务阶段切换. 剩余任务数: " << taskQueue.size() - currentTaskIdx << endl;
+            }
+
+            return cmd;
+        };
+
+        // 运行实时控制
+        rtCon->setControlLoop(masterCallback, 0, true);
+        rtCon->startMove(RtControllerMode::cartesianPosition);
+        
+        cout << "开始实时任务链运行..." << endl;
+        rtCon->startLoop(true); // 阻塞运行，直到所有任务 Finished
+        cout << "所有任务执行完毕。" << endl;
+
+    } catch (const exception &e) {
+        cerr << "异常: " << e.what() << endl;
+    }
 
     return 0;
 }

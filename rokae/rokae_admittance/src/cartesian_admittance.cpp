@@ -289,8 +289,8 @@ private:
         // 读取当前位姿作为起点
         std::array<double, 16> init_pose_arr;
         std::error_code ec;
-        //robot_ptr_->getStateData(RtSupportedFields::tcpPose_m, init_pose_arr);
-        init_pose_arr = robot_ptr_->cartPosture(CoordinateType::endInRef, ec);
+        robot_ptr_->getStateData(RtSupportedFields::tcpPose_m, init_pose_arr);
+        //init_pose_arr = robot_ptr_->cartPosture(CoordinateType::endInRef, ec);
         
         Eigen::Matrix4d start_mat = Utils::ArrayToEigen(init_pose_arr);
         
@@ -325,8 +325,8 @@ private:
         // 读取当前位姿作为起点 (即上一段运动的终点)
         std::array<double, 16> init_pose_arr;
         std::error_code ec;
-        //robot_ptr_->getStateData(RtSupportedFields::tcpPose_m, init_pose_arr);
-        init_pose_arr = robot_ptr_->cartPosture(CoordinateType::flangeInBase, ec);
+        robot_ptr_->getStateData(RtSupportedFields::tcpPose_m, init_pose_arr);
+        //init_pose_arr = robot_ptr_->cartPosture(CoordinateType::flangeInBase, ec);
 
         
         Eigen::Matrix4d start_mat = Utils::ArrayToEigen(init_pose_arr);
