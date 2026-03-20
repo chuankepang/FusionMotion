@@ -33,7 +33,6 @@ public:
 // =============================================================================
 // 2. 笛卡尔空间 S 曲线直线运动任务 (API 封装)
 // =============================================================================
-// 参数是target，最大速度v_max
 class SLineTask : public RTTask {
 public:
     SLineTask(const std::array<double, 16>& target, double v_max = 0.1, std::string taskName = "SLineMove")
